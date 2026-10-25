@@ -400,3 +400,453 @@ test "writer requires sample guard points and supports unlooped zero loop positi
     bank.samples = &changed_samples;
     try sf.validate(bank);
 }
+
+fn referenceBytes() [668]u8 {
+    const hex = std.mem.trim(u8, @embedFile("fixtures/minimal.hex"), "\n\r ");
+    var bytes: [668]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
+
+    return bytes;
+}
+
+test "borrowed file decodes unaligned little endian records and frame blocks" {
+    const original = referenceBytes();
+    var storage: [669]u8 align(2) = undefined;
+    @memcpy(storage[1..], &original);
+    try testing.expect(@intFromPtr(storage[1..].ptr) % 2 == 1);
+
+    const file = try sf.File.parse(storage[1..]);
+    try file.validate();
+    try testing.expectEqual(storage[1..].ptr, file.bytes.ptr);
+    try testing.expectEqual(@as(usize, 1), file.samples.count());
+    try testing.expectEqual(
+        @as(i8, -7),
+        (try file.samples.get(@as(sf.SampleId, @enumFromInt(0)))).pitch_correction,
+    );
+    try testing.expectError(error.InvalidIndex, file.samples.get(1));
+    try testing.expectError(error.InvalidIndex, file.samples.get(-1));
+
+    var headers = file.samples.openCursor();
+    try testing.expectEqualDeep(try file.samples.get(0), (try headers.next()).?);
+    try testing.expectEqual(null, try headers.next());
+
+    var frames = try file.frames(@enumFromInt(0));
+    var block: [7]i16 = undefined;
+    var frame_index: i16 = -32;
+    while (try frames.next()) |frame| {
+        try testing.expectEqual(frame_index, frame);
+        frame_index += 1;
+    }
+    try testing.expectEqual(@as(i16, 32), frame_index);
+
+    frames = try file.frames(@enumFromInt(0));
+    try testing.expectEqual(@as(usize, 7), try frames.read(&block));
+    try testing.expectEqualSlices(i16, &.{ -32, -31, -30, -29, -28, -27, -26 }, &block);
+    try testing.expectEqual(@as(i16, -25), (try frames.next()).?);
+}
+
+test "parsing checks table structure while full validation checks references" {
+    var bytes = referenceBytes();
+    const target = try tableOffset(&bytes, "pgen") + 2;
+    std.mem.writeInt(u16, bytes[target..][0..2], 42, .little);
+
+    const file = try sf.File.parse(&bytes);
+    try testing.expectError(error.InvalidIndex, file.validate());
+
+    const bag = try tableOffset(&bytes, "pbag");
+    std.mem.writeInt(u16, bytes[bag..][0..2], 1, .little);
+    try testing.expectError(error.InvalidIndex, sf.File.parse(&bytes));
+}
+
+test "owning document detaches all metadata, zones, both PCM planes and opaque chunks" {
+    var bank = fixture();
+    var low: [pcm.len]u8 = @splat(0);
+    low[0] = 0x81;
+    bank.sample_data_low = &low;
+    bank.extra_chunks = &.{.{ .parent = .top, .tag = "test".*, .data = "borrowed bytes" }};
+    const bytes = try sf.encode(testing.allocator, bank);
+    const file = try sf.File.parse(bytes);
+
+    var document = try file.toDocument(testing.allocator);
+    defer document.deinit();
+
+    @memset(bytes, 0xff);
+    testing.allocator.free(bytes);
+    try testing.expectEqualDeep(bank, document.bank);
+
+    const rewritten = try sf.encode(testing.allocator, document.bank);
+    defer testing.allocator.free(rewritten);
+    const reread = try sf.File.parse(rewritten);
+    try reread.validate();
+}
+
+test "borrowed files and banks write byte equivalent output without allocating" {
+    var bank = fixture();
+    const odd_pcm: [111]i16 = @splat(0);
+    var low: [111]u8 = @splat(0);
+    low[3] = 0xef;
+    bank.sample_data = &odd_pcm;
+    bank.sample_data_low = &low;
+    bank.extra_chunks = &.{
+        .{ .parent = .top, .tag = "LIST".*, .data = "abcdopaque" },
+        .{ .parent = .sdta, .tag = "test".*, .data = "odd" },
+        .{ .parent = .pdta, .tag = "xtra".*, .data = "bytes" },
+    };
+
+    const encoded = try sf.encode(testing.allocator, bank);
+    defer testing.allocator.free(encoded);
+    const file = try sf.File.parse(encoded);
+    try file.validate();
+
+    var storage: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try sf.write(&writer, bank);
+    try testing.expectEqualSlices(u8, encoded, writer.buffered());
+
+    writer = .fixed(&storage);
+    try sf.writeSource(&writer, file.source());
+    try testing.expectEqualSlices(u8, encoded, writer.buffered());
+    try testing.expectEqual(@as(u64, encoded.len), (try sf.Layout.calculate(file.source())).byteCount());
+}
+
+fn ListCursor(comptime Entry: type) type {
+    return struct {
+        inner: sf.source.SliceCursor(Entry),
+        steps: ?*usize,
+        fail: bool,
+
+        pub fn next(self: *@This()) !?Entry {
+            if (self.steps) |steps|
+                steps.* += 1;
+            if (self.fail)
+                return error.ListSourceFailed;
+
+            return self.inner.next();
+        }
+    };
+}
+
+const ProbeSource = struct {
+    bank: sf.Bank,
+    reads: *usize,
+    frame_count: ?usize = null,
+    max_read: usize = 512,
+    fail_audio: bool = false,
+    fail_guard: bool = false,
+    fail_low: bool = false,
+    zero_audio: bool = false,
+    oversized_audio: bool = false,
+    largest_request: ?*usize = null,
+    list_steps: ?*usize = null,
+    fail_metadata: bool = false,
+    fail_extras: bool = false,
+
+    pub fn metadata(self: ProbeSource) ListCursor(sf.Info) {
+        return .{
+            .inner = self.bank.source().metadata(),
+            .steps = self.list_steps,
+            .fail = self.fail_metadata,
+        };
+    }
+
+    pub fn sampleCount(self: ProbeSource) usize {
+        return self.bank.samples.len;
+    }
+
+    pub fn sampleAt(self: ProbeSource, index: usize) !sf.Sample {
+        return self.bank.source().sampleAt(index);
+    }
+
+    pub fn presetCount(self: ProbeSource) usize {
+        return self.bank.presets.len;
+    }
+
+    pub fn presetAt(self: ProbeSource, index: usize) !sf.source.PresetHeader {
+        return self.bank.source().presetAt(index);
+    }
+
+    pub fn presetZone(self: ProbeSource, object: usize, index: usize) !sf.source.BankZone(sf.InstrumentId) {
+        return self.bank.source().presetZone(object, index);
+    }
+
+    pub fn instrumentCount(self: ProbeSource) usize {
+        return self.bank.instruments.len;
+    }
+
+    pub fn instrumentAt(self: ProbeSource, index: usize) !sf.source.InstrumentHeader {
+        return self.bank.source().instrumentAt(index);
+    }
+
+    pub fn instrumentZone(self: ProbeSource, object: usize, index: usize) !sf.source.BankZone(sf.SampleId) {
+        return self.bank.source().instrumentZone(object, index);
+    }
+
+    pub fn frameCount(self: ProbeSource) usize {
+        return self.frame_count orelse self.bank.sample_data.len;
+    }
+
+    pub fn hasLowFrames(self: ProbeSource) bool {
+        return self.bank.sample_data_low != null;
+    }
+
+    pub fn lowFrameCount(self: ProbeSource) usize {
+        return self.bank.source().lowFrameCount();
+    }
+
+    pub fn readFrames(self: ProbeSource, offset: usize, buffer: []i16) !usize {
+        self.reads.* += 1;
+        if (self.largest_request) |largest|
+            largest.* = @max(largest.*, buffer.len);
+
+        if (self.fail_guard and offset >= 64)
+            return error.SampleSourceFailed;
+
+        if (offset < 64) {
+            if (self.fail_audio)
+                return error.SampleSourceFailed;
+            if (self.zero_audio)
+                return 0;
+            if (self.oversized_audio)
+                return buffer.len + 1;
+        }
+
+        return self.bank.source().readFrames(offset, buffer[0..@min(buffer.len, self.max_read)]);
+    }
+
+    pub fn readLowFrames(self: ProbeSource, offset: usize, buffer: []u8) !usize {
+        self.reads.* += 1;
+        if (self.largest_request) |largest|
+            largest.* = @max(largest.*, buffer.len);
+
+        if (self.fail_low and offset < 64)
+            return error.SampleSourceFailed;
+
+        return self.bank.source().readLowFrames(offset, buffer[0..@min(buffer.len, self.max_read)]);
+    }
+
+    pub fn extraChunks(self: ProbeSource) ListCursor(sf.Chunk) {
+        return .{
+            .inner = self.bank.source().extraChunks(),
+            .steps = self.list_steps,
+            .fail = self.fail_extras,
+        };
+    }
+};
+
+test "layout calculation reads no PCM and checks sample and RIFF size overflow" {
+    var reads: usize = 0;
+    var source: ProbeSource = .{ .bank = fixture(), .reads = &reads };
+    const layout = try sf.Layout.calculate(source);
+    try testing.expectEqual(@as(usize, 0), reads);
+
+    const bytes = try sf.encode(testing.allocator, source.bank);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqual(@as(u64, bytes.len), layout.byteCount());
+
+    source.frame_count = std.math.maxInt(u32);
+    try testing.expectError(error.TooLarge, sf.Layout.calculate(source));
+
+    source.frame_count = std.math.maxInt(u32) / 2;
+    try testing.expectError(error.TooLarge, sf.Layout.calculate(source));
+
+    source.frame_count = std.math.maxInt(usize);
+    try testing.expectError(error.TooLarge, sf.Layout.calculate(source));
+    try testing.expectEqual(@as(usize, 0), reads);
+}
+
+test "structural and sizing errors leave the writer untouched" {
+    var storage: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    var bank = fixture();
+    var changed_samples = samples;
+    changed_samples[0].link = 42;
+    changed_samples[0].sample_type = .left;
+    bank.samples = &changed_samples;
+    try testing.expectError(error.InvalidIndex, sf.write(&writer, bank));
+    try testing.expectEqual(@as(usize, 0), writer.buffered().len);
+
+    var reads: usize = 0;
+    const failed_guard: ProbeSource = .{ .bank = fixture(), .reads = &reads, .fail_guard = true };
+    try testing.expectError(error.SampleSourceFailed, sf.writeSource(&writer, failed_guard));
+    try testing.expectEqual(@as(usize, 0), writer.buffered().len);
+
+    const source: ProbeSource = .{
+        .bank = fixture(),
+        .reads = &reads,
+        .frame_count = std.math.maxInt(u32) / 2,
+    };
+    try testing.expectError(error.TooLarge, sf.writeSource(&writer, source));
+    try testing.expectEqual(@as(usize, 0), writer.buffered().len);
+}
+
+test "sample-source and output errors can leave partial output" {
+    var reads: usize = 0;
+    var source: ProbeSource = .{ .bank = fixture(), .reads = &reads, .fail_audio = true };
+    var storage: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try testing.expectError(error.SampleSourceFailed, sf.writeSource(&writer, source));
+    try testing.expect(writer.buffered().len > 0);
+
+    source.fail_audio = false;
+    source.zero_audio = true;
+    writer = .fixed(&storage);
+    try testing.expectError(error.InvalidSample, sf.writeSource(&writer, source));
+    try testing.expect(writer.buffered().len > 0);
+
+    source.zero_audio = false;
+    source.oversized_audio = true;
+    writer = .fixed(&storage);
+    try testing.expectError(error.InvalidSample, sf.writeSource(&writer, source));
+    try testing.expect(writer.buffered().len > 0);
+
+    var tiny: [32]u8 = undefined;
+    writer = .fixed(&tiny);
+    try testing.expectError(error.WriteFailed, sf.write(&writer, fixture()));
+    try testing.expect(writer.buffered().len > 0);
+}
+
+test "short block reads make progress in both PCM planes and low-plane failures propagate" {
+    var bank = fixture();
+    var low: [pcm.len]u8 = @splat(0);
+    low[0] = 0x82;
+    bank.sample_data_low = &low;
+    var reads: usize = 0;
+    var source: ProbeSource = .{ .bank = bank, .reads = &reads, .max_read = 7 };
+    var storage: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try sf.writeSource(&writer, source);
+
+    const bytes = try sf.encode(testing.allocator, bank);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, bytes, writer.buffered());
+
+    source.fail_low = true;
+    writer = .fixed(&storage);
+    try testing.expectError(error.SampleSourceFailed, sf.writeSource(&writer, source));
+    try testing.expect(writer.buffered().len > 0);
+}
+
+test "streaming preserves multi-block PCM pools with bounded read requests" {
+    var data: [2048]i16 = undefined;
+    var low: [2048]u8 = undefined;
+    for (&data, &low, 0..) |*frame, *low_byte, index| {
+        frame.* = @as(i16, @intCast(index)) - 1024;
+        low_byte.* = @truncate(index);
+    }
+    @memset(data[1500..1546], 0);
+    @memset(low[1500..1546], 0);
+
+    var changed_samples = samples;
+    changed_samples[0].end = 1500;
+    var bank = fixture();
+    bank.samples = &changed_samples;
+    bank.sample_data = &data;
+    bank.sample_data_low = &low;
+
+    var reads: usize = 0;
+    var largest_request: usize = 0;
+    const source: ProbeSource = .{
+        .bank = bank,
+        .reads = &reads,
+        .max_read = 7,
+        .largest_request = &largest_request,
+    };
+    var storage: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try sf.writeSource(&writer, source);
+    try testing.expectEqual(@as(usize, 512), largest_request);
+
+    const bytes = try sf.encode(testing.allocator, bank);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, bytes, writer.buffered());
+
+    const file = try sf.File.parse(writer.buffered());
+    var decoded: [2048]i16 = undefined;
+    try testing.expectEqual(data.len, try file.readFrames(0, &decoded));
+    try testing.expectEqualSlices(i16, &data, &decoded);
+}
+
+test "variable length lists take a bounded number of sequential passes" {
+    var metadata: [131]sf.Info = undefined;
+    var extras: [128]sf.Chunk = undefined;
+    var storage: [8192]u8 = undefined;
+
+    for ([_]usize{ 64, 128 }) |count| {
+        var bank = fixture();
+        @memcpy(metadata[0..3], bank.info);
+        @memset(metadata[3..], .{ .tag = "test".*, .data = "payload" });
+        @memset(&extras, .{ .parent = .top, .tag = "test".*, .data = "payload" });
+        bank.info = metadata[0 .. count + 3];
+        bank.extra_chunks = extras[0..count];
+
+        var reads: usize = 0;
+        var steps: usize = 0;
+        const source: ProbeSource = .{ .bank = bank, .reads = &reads, .list_steps = &steps };
+        var writer: std.Io.Writer = .fixed(&storage);
+        try sf.writeSource(&writer, source);
+        try testing.expect(steps <= 8 * (bank.info.len + bank.extra_chunks.len + 2));
+
+        const expected = try sf.encode(testing.allocator, bank);
+        defer testing.allocator.free(expected);
+        try testing.expectEqualSlices(u8, expected, writer.buffered());
+    }
+}
+
+test "metadata and extra cursor failures propagate before output" {
+    var reads: usize = 0;
+    var source: ProbeSource = .{ .bank = fixture(), .reads = &reads, .fail_metadata = true };
+    var storage: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try testing.expectError(error.ListSourceFailed, sf.writeSource(&writer, source));
+    try testing.expectEqual(@as(usize, 0), writer.buffered().len);
+
+    source.fail_metadata = false;
+    source.fail_extras = true;
+    try testing.expectError(error.ListSourceFailed, sf.Layout.calculate(source));
+    try testing.expectError(error.ListSourceFailed, sf.writeSource(&writer, source));
+    try testing.expectEqual(@as(usize, 0), writer.buffered().len);
+}
+
+test "large borrowed metadata and opaque lists round trip and materialize" {
+    var bank = fixture();
+    const metadata = try testing.allocator.alloc(sf.Info, 4099);
+    defer testing.allocator.free(metadata);
+    @memcpy(metadata[0..3], bank.info);
+    @memset(metadata[3..], .{ .tag = "test".*, .data = "payload" });
+    bank.info = metadata;
+
+    const extras = try testing.allocator.alloc(sf.Chunk, 4096);
+    defer testing.allocator.free(extras);
+    for (extras, 0..) |*entry, index| {
+        entry.* = .{
+            .parent = switch (index % 3) {
+                0 => .top,
+                1 => .sdta,
+                else => .pdta,
+            },
+            .tag = "test".*,
+            .data = "payload",
+        };
+    }
+    bank.extra_chunks = extras;
+
+    const expected = try sf.encode(testing.allocator, bank);
+    defer testing.allocator.free(expected);
+    const file = try sf.File.parse(expected);
+    try file.validate();
+
+    const storage = try testing.allocator.alloc(u8, expected.len);
+    defer testing.allocator.free(storage);
+    var writer: std.Io.Writer = .fixed(storage);
+    try sf.writeSource(&writer, file);
+    try testing.expectEqualSlices(u8, expected, writer.buffered());
+
+    var document = try file.toDocument(testing.allocator);
+    defer document.deinit();
+    try testing.expectEqual(metadata.len, document.bank.info.len);
+    try testing.expectEqual(extras.len, document.bank.extra_chunks.len);
+
+    writer = .fixed(storage);
+    try sf.write(&writer, document.bank);
+    try testing.expectEqualSlices(u8, expected, writer.buffered());
+}

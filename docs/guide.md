@@ -4,7 +4,33 @@ SoundFondue is a Zig 0.16 module for reading, editing, and writing SoundFont 2 b
 
 ## Read, edit, write
 
-`decode` and `encode` operate on whole-file bytes. The application owns file I/O, paths, size limits, and save/replace policy. There are no process-global resources.
+The application owns file I/O, paths, size limits, and save/replace policy. There are no process-global resources.
+
+### Inspect without allocating
+
+`File.parse(bytes)` retains borrowed spans into the input, checking RIFF sizes, chunk boundaries, table widths, and monotonic table indices. `file.validate()` checks metadata, references, zones, sample bounds, and guard frames. Both operations work without allocating. Keep the original bytes alive and immutable for the lifetime of the file and any records, metadata payloads, zones, or frame cursors borrowed from it.
+
+```zig
+const sf = @import("soundfondue");
+
+const file = try sf.File.parse(input_bytes);
+try file.validate();
+
+const id: sf.SampleId = @enumFromInt(0);
+const sample = try file.samples.get(id);
+var frames = try file.frames(id);
+while (try frames.next()) |frame| {
+    // Use the signed PCM value here.
+}
+```
+
+`file.presets`, `file.instruments`, and `file.samples` expose `count()`, `get(index)`, and `openCursor()`. Cursors return decoded records by value and exclude terminal records. Preset and instrument headers retain their encoded `zone_start` and `zone_end` indices; `file.presetZone(object, local_index)` and `file.instrumentZone(object, local_index)` expose their zones. Zone generators and modulators support the same table access.
+
+PCM stays encoded in the borrowed view. `Frames.next()` reads a little-endian signed 16-bit value without assuming alignment or host byte order. `Frames.read(buffer)` decodes a block into caller-supplied storage. For 24-bit banks, these are the high 16 bits; `file.readLowFrames(offset, buffer)` reads the corresponding low bytes by absolute pool offset. `file.readFrames(offset, buffer)` similarly reads any part of the entire pool, including unused frames. `file.metadata()` walks borrowed INFO records, and `file.extraChunks()` walks borrowed opaque chunks. Both advance sequentially; use them rather than repeated indexed lookups to traverse a whole list. Validation, sizing, writing, and document materialization use these cursors and take linear time over the lists.
+
+### Materialize a document to edit
+
+Use `file.toDocument(allocator)` after inspecting a borrowed file, or `decode(allocator, bytes)` to parse and materialize in one call.
 
 ```zig
 const sf = @import("soundfondue");
@@ -20,9 +46,22 @@ const output_bytes = try sf.encode(allocator, document.bank);
 defer allocator.free(output_bytes);
 ```
 
-Decoding copies the input and owns all decoded storage in `Document.arena`. The input may be freed immediately. `Document.deinit()` frees the entire document, including edits allocated through `document.allocator()`. Treat a document as a single owner; do not copy it and deinitialize both copies. Allocators obtained from a document must not outlive it or be retained across moving the document.
+Materializing validates the file, decodes its PCM pool into one owned allocation, and copies metadata, zones, modulators, low sample bytes, and opaque payloads into `Document.arena`. It does not retain a copy of the encoded input file. The input may be freed immediately after success. `Document.deinit()` frees the entire document, including edits allocated through `document.allocator()`. Treat a document as a single owner; do not copy it and deinitialize both copies. Allocators obtained from a document must not outlive it or be retained across moving the document.
 
-`Bank` itself is a borrowed view. It can also be constructed directly from caller-owned slices and passed to `validate` or `encode`; no `Document` is needed. Its slices must remain alive throughout those calls. Encoding neither modifies the bank nor takes ownership of it. Its returned bytes belong to the allocator passed to `encode`.
+`Bank` contains decoded, nested slices; `File` contains encoded, borrowed spans. A bank can also be constructed directly from caller-owned slices and passed to `validate` or `encode`; no `Document` is needed. Its slices must remain alive throughout those calls. Encoding neither modifies the bank nor takes ownership of it. Its returned bytes belong to the allocator passed to `encode`.
+
+### Write to a stream
+
+```zig
+try sf.write(writer, document.bank);
+try sf.writeSource(writer, file);
+```
+
+`write` adapts a `Bank`; `writeSource` accepts either `bank.source()`, a borrowed `File`, or a [custom indexed source](sources.md). Both validate the source and calculate all sizes and table counts with checked arithmetic before emitting any bytes. Headers contain their final sizes; output requires neither seeking nor backpatching. PCM is read and encoded in blocks of at most 512 frames, with bounded scratch space and no output allocation. The writer's own buffering and any custom source allocations remain under caller control. Flush the writer yourself when needed.
+
+`encode(allocator, bank)` uses the same writing implementation with `std.Io.Writer.Allocating` and returns the complete byte buffer. `Layout.calculate(source)` calculates checked sizes without reading PCM; it is a sizing operation, not a replacement for full validation. Full validation separately reads the 46 guard frames after each sample in each present PCM plane.
+
+Keep the source and its borrowed storage unchanged throughout validation, sizing, and writing. Structural and size errors are detected before output begins. Source or output failures during emission can leave partial output; `writeSource` propagates source errors, and writer errors use `error.WriteFailed`. Neither writer flushes or rolls back partial output. `encode` maps allocating-writer failures to `error.OutOfMemory` and frees any partial buffer.
 
 ## Representation
 
@@ -47,13 +86,13 @@ An adapter will need to define how it selects layers, maps parameters, and repor
 
 ## Validation and round trips
 
-The reader checks RIFF sizes and padding, required lists and tables, record widths, monotonic table indices, terminal index coverage, reference bounds, zone structure, sample bounds and guard frames, and mandatory metadata. The writer runs the same checks and enforces the format's 16-bit table-index limits. Malformed input fails without publishing a partial document. Every allocation failure releases intermediate storage.
+Parsing checks RIFF sizes and padding, required lists and tables, record widths, monotonic table indices, and terminal index coverage. Full validation checks reference bounds, zone structure, sample bounds and guard frames, and mandatory metadata. The writer runs full validation and enforces the format's 16-bit table-index and 32-bit RIFF-size limits before output. Malformed input fails without publishing a partial document. Every allocation failure releases intermediate storage.
 
 Round trips preserve represented data, not the original byte layout. The writer uses canonical list/table order, moves opaque chunks to the end of their parent, emits zero RIFF padding and conventional terminal records, and normalizes the optional `sm24` alignment byte. Terminal record fields and original chunk positions are not retained. Unknown chunks remain opaque: external offsets inside them are not interpreted or relocated.
 
 This first pass supports SF2 2.00 through 2.04 RAM sample banks. ROM sample banks, SF3 compression, and newer format extensions requiring a changed sample encoding are unsupported. Structural validation is intentionally stricter than permissive synthesizers: malformed zones and metadata are rejected rather than repaired. It does not certify complete musical validity or portable hardware playback.
 
-Tests cover an independently assembled SF2 2.01 fixture, 16/24-bit round trips, stereo metadata, global and local zones, native parameters, opaque chunks, truncation, byte mutations, hostile indices, table overflow, and allocation failures. A third-party bank corpus and live Substrate integration remain future validation work.
+Tests cover an independently assembled SF2 2.01 fixture, 16/24-bit round trips, stereo metadata, global and local zones, native parameters, opaque chunks, truncation, byte mutations, hostile indices, table overflow, allocation failures, unaligned input, detached document ownership, direct/allocating writer equivalence, checked layout sizing, short block reads, and partial-output failures. A third-party bank corpus and live Substrate integration remain future validation work.
 
 See the [SF2 specification summary](sf2-spec-2.04.md) for the file format, including [sample data](sf2-spec-2.04.md#6-the-sdta-list-chunk), [zone rules](sf2-spec-2.04.md#important-rules), and [generator units](sf2-spec-2.04.md#81-generators).
 

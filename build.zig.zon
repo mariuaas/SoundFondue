@@ -9,6 +9,7 @@
         "src",
         "tests",
         "docs/guide.md",
+        "docs/sources.md",
         "docs/sf2-spec-2.04.md",
         "README.md",
         "LICENSE",

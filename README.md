@@ -2,7 +2,7 @@
 
 This is a small SF2 format reader / writer written in Zig. Extracted / constructed to function alongside some other private projects I am working on, particularly [SMuLE](https://github.com/mariuaas/SMuLE) and [NoteSelf](https://github.com/mariuaas/noteself). They were extracted because the other projects are bloating up in size, and I rather like extracting reusable modular variants that others might use in their projects.
 
-It reads a bank into an editable document and writes it back out. No dependencies or playback engine; bring your own file I/O.
+Inspect a bank without allocating, load a document to edit, or write straight to a `std.Io.Writer`. No dependencies or playback engine; bring your own file I/O.
 
 ## Getting started
 
@@ -21,14 +21,13 @@ Already have SF2 bytes in memory?
 ```zig
 const sf = @import("soundfondue");
 
-var document = try sf.decode(allocator, input_bytes);
-defer document.deinit();
+const file = try sf.File.parse(input_bytes);
+try file.validate();
 
-const output_bytes = try sf.encode(allocator, document.bank);
-defer allocator.free(output_bytes);
+try sf.writeSource(writer, file);
 ```
 
-The [guide](docs/guide.md) covers editing, ownership, the bank representation, and the current limitations. There's also a [summary of the SF2 spec](docs/sf2-spec-2.04.md) if you want to dig into the file format.
+Need to edit? `file.toDocument(allocator)` gives you an owning bank. `decode` and `encode` are there for convenient whole-file buffers too. The [guide](docs/guide.md) covers ownership, the representation, and the current limitations; [custom sources](docs/sources.md) explains how to supply your own data. There's also a [summary of the SF2 spec](docs/sf2-spec-2.04.md) if you want to dig into the file format.
 
 ## Testing and Dev
 

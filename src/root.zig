@@ -20,9 +20,17 @@ pub const Range = model.Range;
 pub const SampleType = model.SampleType;
 pub const Error = @import("binary.zig").Error;
 pub const Document = @import("reader.zig").Document;
+pub const File = @import("file.zig").File;
+pub const Frames = @import("file.zig").Frames;
+pub const source = @import("source.zig");
 pub const decode = @import("reader.zig").decode;
 pub const encode = @import("writer.zig").encode;
+pub const write = @import("writer.zig").write;
+pub const writeSource = @import("writer.zig").writeSource;
+pub const Layout = @import("writer.zig").Layout;
+pub const WriteError = @import("writer.zig").WriteError;
 pub const validate = @import("validate.zig").validate;
+pub const validateSource = @import("validate.zig").validateSource;
 
 pub fn timecentsToSeconds(value: i16) f64 {
     return if (value == std.math.minInt(i16))

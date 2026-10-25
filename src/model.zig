@@ -196,6 +196,10 @@ pub const Bank = struct {
     presets: []const Preset = &.{},
     extra_chunks: []const Chunk = &.{},
 
+    pub fn source(self: Bank) @import("source.zig").BankSource {
+        return .{ .bank = self };
+    }
+
     pub fn metadata(self: Bank, tag: [4]u8) ?[]const u8 {
         for (self.info) |entry|
             if (std.mem.eql(u8, &entry.tag, &tag))
