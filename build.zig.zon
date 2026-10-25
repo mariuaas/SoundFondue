@@ -1,0 +1,16 @@
+.{
+    .name = .soundfondue,
+    .fingerprint = 0x127f7175d0e514f5,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "docs/guide.md",
+        "docs/sf2-spec-2.04.md",
+        "README.md",
+        "LICENSE",
+    },
+}
